@@ -2,6 +2,10 @@
 #include "heap_internal.h"
 #include <pthread.h>
 #include <stdlib.h>
+#include <string.h>
+
+_Static_assert(sizeof(size_t) == sizeof(void*), "size_t same size as pointer required");
+
 
 struct Heap {
     size_t segment_size_bytes;
@@ -66,13 +70,14 @@ static void free_list_remove(BlockHeader** head, BlockHeader* prev, BlockHeader*
 Heap* create_heap(size_t segment_size_bytes, size_t gc_threshold_bytes)
 {
     Heap* h = (Heap*)calloc(1, sizeof(Heap));
+   if (!h) {
+        return NULL;
+    }
+    
     h->roots = NULL;
     h->roots_count = 0;
     h->roots_capacity = 0;
 
-    if (!h) {
-        return NULL;
-    }
     h->segment_size_bytes = segment_size_bytes;
     h->gc_threshold_bytes = gc_threshold_bytes;
 
@@ -144,16 +149,16 @@ void* alloc_heap(Heap* h, size_t size_bytes)
     }
 
     if (!cur) {
-        Segment* ns = segment_create(h->segment_size_bytes);
-        if (!ns) {
+        Segment* nseg = segment_create(h->segment_size_bytes);
+        if (!nseg) {
             pthread_mutex_unlock(&h->lock);
             return NULL;
         }
-        ns->next = h->segments;
-        h->segments = ns;
+        nseg->next = h->segments;
+        h->segments = nseg;
 
-        BlockHeader* nb = (BlockHeader*)(void*)ns->mem;
-        nb->size = ns->size - sizeof(BlockHeader);
+        BlockHeader* nb = (BlockHeader*)(void*)nseg->mem;
+        nb->size = nseg->size - sizeof(BlockHeader);
         nb->magic = BLOCK_MAGIC;
         nb->flags = BLOCK_FLAG_FREE;
         nb->next_free = NULL;
@@ -200,6 +205,7 @@ void* alloc_heap(Heap* h, size_t size_bytes)
     h->allocated_bytes += cur->size;
 
     void* out = (void*)(cur + 1);
+    memset(out, 0, cur->size);
     pthread_mutex_unlock(&h->lock);
     return out;
 }
@@ -224,7 +230,11 @@ void free_heap(Heap* h, void* ptr)
     
     block->flags |= BLOCK_FLAG_FREE;
     block->flags &= ~BLOCK_FLAG_MARK;
-    h->allocated_bytes -= block->size;
+    if (h->allocated_bytes >= block->size) {
+        h->allocated_bytes -= block->size;
+    } else {
+        h->allocated_bytes = 0;
+    }
 
     free_list_push(&h->free_list, block);
     pthread_mutex_unlock(&h->lock);
@@ -232,19 +242,34 @@ void free_heap(Heap* h, void* ptr)
 
 static int ptr_in_segment(const Segment* seg, const void* p)
 {
-    const unsigned char* start = seg->mem;
-    const unsigned char* end   = seg->mem + seg->size;
-    const unsigned char* x     = (const unsigned char*)p;
+    size_t start = (size_t)(const void*)seg->mem;
+    size_t end   = start + seg->size;
+    size_t x     = (size_t)p;
     return (x >= start) && (x < end);
 }
 
 static BlockHeader* block_from_payload(Heap* h, void* payload)
 {
-    if (!payload) {
+    if (!h ||!payload) {
         return NULL;
     }
 
     BlockHeader* b = ((BlockHeader*)payload) - 1;
+
+    Segment* seg = h->segments;
+    int in_segment = 0;
+    while (seg) {
+        if (ptr_in_segment(seg, (void*)b)) {
+            in_segment = 1;
+            break;
+        }
+        seg = seg  ->next;
+    }
+    
+    if (!in_segment) {
+        return NULL;
+    }
+
     if (b->magic != BLOCK_MAGIC) {
         return NULL;
     }
@@ -252,25 +277,18 @@ static BlockHeader* block_from_payload(Heap* h, void* payload)
         return NULL;
     }
 
-    Segment* s = h->segments;
-    while (s) {
-        if (ptr_in_segment(s, (void*)b)) {
-            return b;
-        }
-        s = s->next;
-    }
 
-    return NULL;
+    return b;
 }
 
 typedef void (*block_visit_fn)(Heap* h, Segment* seg, BlockHeader* b, void* ctx);
 
 static void for_each_block(Heap* h, block_visit_fn fn, void* ctx)
 {
-    Segment* s = h->segments;
-    while (s) {
-        unsigned char* cur = s->mem;
-        unsigned char* end = s->mem + s->size;
+    Segment* seg = h->segments;
+    while (seg) {
+        unsigned char* cur = seg->mem;
+        unsigned char* end = seg->mem + seg->size;
 
         while (cur + sizeof(BlockHeader) <= end) {
             BlockHeader* b = (BlockHeader*)(void*)cur;
@@ -279,25 +297,153 @@ static void for_each_block(Heap* h, block_visit_fn fn, void* ctx)
                 break;
             }
 
-            fn(h, s, b, ctx);
+            fn(h, seg, b, ctx);
 
             size_t step = sizeof(BlockHeader) + b->size;
-            cur += step;
-
-            if (step == 0) {
+            if (step == 0 || cur + step > end) {
                 break;
             }
+            cur += step;
         }
 
-        s = s->next;
+        seg = seg->next;
     }
+}
+
+typedef struct MarkStack {
+    BlockHeader** items;
+    size_t len;
+    size_t cap;
+} MarkStack;
+
+static int markstack_init(MarkStack* st)
+{
+    st->cap = 128;
+    st->len = 0;
+    st->items = (BlockHeader**)malloc(st->cap * sizeof(BlockHeader*));
+    return st->items ? 0 : -1;
+}
+
+static void markstack_destroy(MarkStack* st)
+{
+    free(st->items);
+    st->items = NULL;
+    st->len = 0;
+    st->cap = 0;
+}
+
+static void markstack_push(MarkStack* st, BlockHeader* b)
+{
+    if (st->len == st->cap) {
+        size_t new_cap = st->cap * 2;
+        BlockHeader** ns = (BlockHeader**)realloc(st->items, new_cap * sizeof(BlockHeader*));
+        if (!ns) {
+            return;
+        }
+        st->items = ns;
+        st->cap = new_cap;
+    }
+    st->items[st->len++] = b;
+}
+
+static BlockHeader* markstack_pop(MarkStack* st)
+{
+    if (st->len == 0) {
+        return NULL;
+    }
+    return st->items[--st->len];
+}
+
+static void try_mark(Heap* h, MarkStack* st, void* candidate)
+{
+    BlockHeader* b = block_from_payload(h, candidate);
+    if (!b) {
+        return;
+    }
+
+    if (b->flags & BLOCK_FLAG_MARK) {
+        return;
+    }
+    b->flags |= BLOCK_FLAG_MARK;
+
+    markstack_push(st, b);
+}
+
+
+static void sweep(Heap* hh, Segment* seg, BlockHeader* b, void* ctx)
+{
+    (void)seg;
+
+    size_t* freed = (size_t*)ctx;
+
+    if (b->flags & BLOCK_FLAG_FREE) {
+        b->flags &= ~BLOCK_FLAG_MARK;
+        return;
+    }
+
+    if (b->flags & BLOCK_FLAG_MARK) {
+        b->flags &= ~BLOCK_FLAG_MARK;
+        return;
+    }
+
+    b->flags |= BLOCK_FLAG_FREE;
+
+    if (hh->allocated_bytes >= b->size) hh->allocated_bytes -= b->size;
+    else hh->allocated_bytes = 0;
+
+    free_list_push(&hh->free_list, b);
+    if(freed){
+        (*freed)++;
+    }
+    
 }
 
 
 void collect_heap(Heap* h)
 {
-    (void)h;
+    if (!h) {
+        return;
+    }
+
+    pthread_mutex_lock(&h->lock);
+
+    MarkStack st;
+    if (markstack_init(&st) != 0) {
+        pthread_mutex_unlock(&h->lock);
+        return;
+    }
+
+    for (size_t i = 0; i < h->roots_count; i++) {
+        void** slot = h->roots[i];
+        if (!slot) {
+            continue;
+        }
+        try_mark(h, &st, *slot);
+    }
+
+    for (;;) {
+        BlockHeader* b = markstack_pop(&st);
+        if (!b) {
+            break;
+        }
+
+        size_t* words = (size_t*)(void*)(b + 1);
+        size_t n = b->size / sizeof(size_t);
+
+        for (size_t k = 0; k < n; k++) {
+            void* cand = (void*)words[k];
+            try_mark(h, &st, cand);
+        }
+    }
+
+    markstack_destroy(&st);
+
+    size_t freed = 0;
+    for_each_block(h, sweep, &freed);
+
+    pthread_mutex_unlock(&h->lock);
 }
+
 
 int roots_add(Heap* h, void** slot)
 {
@@ -349,7 +495,7 @@ int roots_remove(Heap* h, void** slot)
     }
 
     pthread_mutex_unlock(&h->lock);
-    return 0;
+    return -1;
 }
 
 int thread_register(Heap* h)

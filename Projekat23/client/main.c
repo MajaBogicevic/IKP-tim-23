@@ -1,26 +1,23 @@
 #include "../heap/heap.h"
 #include <stdio.h>
+#include <string.h>
 
 int main(void)
 {
-    Heap* h = create_heap(1024 * 1024, 8 * 1024 * 1024);
-    if (!h) {
-        printf("heap_create failed\n");
-        return 1;
-    }
+    Heap* h = create_heap(1024 * 1024, 0);
 
-    void* p = alloc_heap(h, 24);
-    roots_add(h, &p);
-    void* q = alloc_heap(h, 100);
-    printf("p=%p \n", p);
-    printf("q=%p \n", q);
+   void* a = alloc_heap(h, 64);
+void* b = alloc_heap(h, 64);
 
-    roots_remove(h, &p);
-    free_heap(h, p);
-    free_heap(h, q);
+/* u payload b upiši pointer ka a */
+memcpy(b, &a, sizeof(void*));
 
-    void* r = alloc_heap(h, 50);
-    printf("r=%p\n", r);
+roots_add(h, &b);
+collect_heap(h);
+
+void* c = alloc_heap(h, 64);
+printf("a=%p b=%p c=%p\n", a, b, c);
+
 
     destroy_heap(h);
     return 0;
