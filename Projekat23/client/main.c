@@ -9,7 +9,6 @@ int main(void)
    void* a = alloc_heap(h, 64);
 void* b = alloc_heap(h, 64);
 
-/* u payload b upiši pointer ka a */
 memcpy(b, &a, sizeof(void*));
 
 roots_add(h, &b);

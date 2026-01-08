@@ -23,6 +23,7 @@ struct Heap {
     size_t roots_capacity;
 };
 
+//NAPRAVI SEGMENT
 static Segment* segment_create(size_t size_bytes)
 {
     Segment* seg = (Segment*)malloc(sizeof(Segment));
@@ -41,6 +42,7 @@ static Segment* segment_create(size_t size_bytes)
     return seg;
 }
 
+//UNISTI SVE SEGMENTE
 static void segment_destroy_all(Segment* seg)
 {
     while (seg) {
@@ -51,12 +53,14 @@ static void segment_destroy_all(Segment* seg)
     }
 }
 
+//DODAJ BLOK NA SLOBODNU LISTU
 static void free_list_push(BlockHeader** head, BlockHeader* block)
 {
     block->next_free = *head;
     *head = block;
 }
 
+//UKLONI BLOK SA SLOBODNE LISTE
 static void free_list_remove(BlockHeader** head, BlockHeader* prev, BlockHeader* cur)
 {
     if (prev) {
@@ -67,6 +71,7 @@ static void free_list_remove(BlockHeader** head, BlockHeader* prev, BlockHeader*
     cur->next_free = NULL;
 }
 
+//KREIRAJ HEAP
 Heap* create_heap(size_t segment_size_bytes, size_t gc_threshold_bytes)
 {
     Heap* h = (Heap*)calloc(1, sizeof(Heap));
@@ -106,6 +111,7 @@ Heap* create_heap(size_t segment_size_bytes, size_t gc_threshold_bytes)
     return h;
 }
 
+//UNISTI HEAP
 void destroy_heap(Heap* h)
 {
     if(!h) {
@@ -127,6 +133,7 @@ void destroy_heap(Heap* h)
     free(h);
 }
 
+//ALOKACIJA MEMORIJE
 void* alloc_heap(Heap* h, size_t size_bytes)
 {
     if (!h || size_bytes == 0) {
@@ -210,6 +217,8 @@ void* alloc_heap(Heap* h, size_t size_bytes)
     return out;
 }
 
+
+//OSLOBODI MEMORIJU
 void free_heap(Heap* h, void* ptr)
 {
     if(!h || !ptr) {
@@ -240,6 +249,7 @@ void free_heap(Heap* h, void* ptr)
     pthread_mutex_unlock(&h->lock);
 }
 
+//POMOCNE FUNKCIJE ZA GC
 static int ptr_in_segment(const Segment* seg, const void* p)
 {
     size_t start = (size_t)(const void*)seg->mem;
@@ -310,6 +320,7 @@ static void for_each_block(Heap* h, block_visit_fn fn, void* ctx)
     }
 }
 
+//MARK 
 typedef struct MarkStack {
     BlockHeader** items;
     size_t len;
@@ -369,7 +380,7 @@ static void try_mark(Heap* h, MarkStack* st, void* candidate)
     markstack_push(st, b);
 }
 
-
+//SWEEP
 static void sweep(Heap* hh, Segment* seg, BlockHeader* b, void* ctx)
 {
     (void)seg;
@@ -398,7 +409,7 @@ static void sweep(Heap* hh, Segment* seg, BlockHeader* b, void* ctx)
     
 }
 
-
+//GC
 void collect_heap(Heap* h)
 {
     if (!h) {
@@ -444,7 +455,7 @@ void collect_heap(Heap* h)
     pthread_mutex_unlock(&h->lock);
 }
 
-
+//POMOCNE FUNKCIJE ZA KORISNIKA HEAPA
 int roots_add(Heap* h, void** slot)
 {
     if(!h || !slot) {
@@ -498,6 +509,7 @@ int roots_remove(Heap* h, void** slot)
     return -1;
 }
 
+//POMOCNE FUNKCIJE ZA RAD SA NITIMA
 int thread_register(Heap* h)
 {
     (void)h;
