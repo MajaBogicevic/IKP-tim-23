@@ -3,9 +3,6 @@
 
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 
 typedef struct Heap Heap;
 
@@ -24,8 +21,5 @@ int   thread_register(Heap* h);
 int   thread_unregister(Heap* h);
 void  gc_safepoint(Heap* h);
 
-#ifdef __cplusplus
-}
-#endif
 
 #endif 
