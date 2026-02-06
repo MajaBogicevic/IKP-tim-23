@@ -4,125 +4,239 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <assert.h>
+#include <mach/mach.h>
+#include <sys/time.h>
 #include <stdatomic.h>
+#include <stdint.h>
+
+//za ispis zauzete RAM memorije
+static double rss_mb(void)
+{
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS)
+        return -1.0;
+
+    return (double)info.resident_size / (1024.0 * 1024.0);
+}
+
+//segment test
+static void run_segment_growth_test(void)
+{
+    printf("\n--------- TEST 2: SEGMENT ----------\n");
+
+    Heap *h = create_heap(64 * 1024, 0);
+    if (h == NULL) {
+        return;
+    }
+
+    const int N = 800;
+    void *ptrs[N];
+
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = alloc_heap(h, 1024);
+        if(ptrs[i] == NULL){
+            printf("FAIL: alloc_heap fail i=%d\n", i);
+            destroy_heap(h);
+            return;
+        }
+        if (i % 50 == 0) {
+            printf("Alloc #%d ptr=%p\n", i, ptrs[i]);
+        }
+        memset(ptrs[i], 0xCD, 32);
+    }
+
+    printf("All allocations completed.\n");
+    for (int i = 0; i < N; i++) ptrs[i] = NULL;
+    collect_heap(h);
+
+    destroy_heap(h);
+    printf("Test 2 is completed.\n");
+}
+
+//mark sweep cuvanje roots kontainera
+static void run_roots_gc_test(Heap *h)
+{
+    printf("\n-------- TEST 1: ROOTS AND MARK ---------\n");
+
+    void *a = alloc_heap(h, 64);
+    if (!a) {
+        printf("FAIL: alloc_heap a\n");
+        return;
+    }
+    memset(a, 0xAB, 64);
+
+    void *b = alloc_heap(h, sizeof(void*));
+    if (!b) {
+        printf("FAIL: alloc_heap b\n");
+        free_heap(h, a);
+        return;
+    }
+    memcpy(b, &a, sizeof(void*));
+
+    int rc = roots_add(h, &b);
+    if (rc != 0) {
+        printf("FAIL: roots_add b\n");
+        free_heap(h, b);
+        free_heap(h, a);
+        return;
+    }    
+    printf("Roots added.\n");
+    collect_heap(h);
+
+    for (int i = 0; i < 64; i++) {
+        if (((unsigned char*)a)[i] != 0xAB) {
+            printf("FAIL: a[%d] occupied after GC\n", i);
+            roots_remove(h, &b);
+            return;
+        }
+    }
+
+    rc = roots_remove(h, &b);
+    if (rc != 0) {
+        printf("FAIL: roots_remove b\n");
+        return;
+    }
+
+    a = NULL;
+    b = NULL;
+    collect_heap(h);
+
+    printf("Test 1 is completed.\n");
+}
+
+// vise niti baratanje sa velikom kolicinom memorije
+typedef struct {
+    int id;
+    unsigned int seed;
+    unsigned long long ops;
+    unsigned long long alloc_ok;
+    unsigned long long alloc_fail;
+    unsigned long long explicit_frees;
+
+} WorkerArgs; //niti
 
 static Heap *g_heap = NULL;
 static atomic_int g_stop = 0;
 
 static size_t g_msg_bytes = 256 * 1024; 
-static int g_window = 16;
+static int g_window = 4;     
 
-static unsigned long long *g_ops = NULL;
-
-static void *worker(void *arg)
+//heap gc za vise niti
+static void *stress_worker(void *arg)
 {
-    int id = (int)(long)arg;
+    WorkerArgs *a = (WorkerArgs*)arg;
+    a->alloc_ok = 0;
+    a->alloc_fail = 0;
+    a->explicit_frees = 0;
 
     thread_register(g_heap);
 
-    void *win[64];
-    int W = g_window;
+    void *win[64]; //cuva pokazivace na alocirane blokove
+    int W = g_window; //velicina prozora
     if (W > 64) W = 64;
     for (int i = 0; i < W; i++) win[i] = NULL;
-
-    void * volatile keep = alloc_heap(g_heap, g_msg_bytes);
-    if (keep) memset((void*)keep, (unsigned char)(0xA0 + (id & 0x0F)), 128);
 
     unsigned long long cnt = 0;
     unsigned long long idx = 0;
 
-    while (!atomic_load(&g_stop))
-    {
+    while (!atomic_load(&g_stop)) {
         void *p = alloc_heap(g_heap, g_msg_bytes);
-        if (p)
-        {
-            memset(p, (unsigned char)(id + 1), 64);
+        if (p) {
+            a->alloc_ok++;
+            memset(p, (unsigned char)(a->id + 1), 64);
             win[idx % (unsigned long long)W] = p;
             idx++;
 
-            if ((cnt % 256ULL) == 0ULL)
-            {
-                for (int j = 0; j < W / 2; j++)
+            if ((cnt % 256) == 0) {
+                for (int j = 0; j < W / 2; j++) {
                     win[(idx + (unsigned long long)j) % (unsigned long long)W] = NULL;
+                }
             }
 
-            // povremeno free jednog bloka da stresira i free-list
-            if ((cnt % 512ULL) == 0ULL)
-            {
-                int k = (int)((idx + 3ULL) % (unsigned long long)W);
+            if ((cnt % 512) == 0) {
+                int k = (int)((idx + 3) % (unsigned long long)W);
                 void *f = win[k];
                 win[k] = NULL;
-                if (f) free_heap(g_heap, f);
+                if (f) {
+                    free_heap(g_heap, f);
+                    a->explicit_frees++;
+                }
             }
+        } else{
+            a->alloc_fail++;
+        }
+
+        if ((cnt % 1024) == 0) {
+            int ms = (int)(rand_r(&a->seed) % 5u);
+            usleep((useconds_t)(ms * 1000));
         }
 
         cnt++;
     }
 
-    // cleanup
     for (int i = 0; i < W; i++) win[i] = NULL;
-    keep = NULL;
 
     thread_unregister(g_heap);
 
-    g_ops[id] = cnt;
+    a->ops = cnt;
     return NULL;
 }
 
-int run_test(int nthreads, int seconds, size_t msg_bytes, int window)
+static void run_multithread_bigmem_test(int nthreads, int seconds, size_t msg_bytes, int window)
 {
-    if (nthreads <= 0) nthreads = 1;
-    if (seconds <= 0) seconds = 5;
-    if (msg_bytes < 1024) msg_bytes = 1024;
-    if (window <= 0) window = 8;
+    printf("\n----------- TEST 3: MULTITHREAD BIG MEMORY STRESS -----------\n");
+    printf("threads=%d, seconds=%d, msg=%zu KB, window=%d\n", nthreads, seconds, msg_bytes / 1024, window);
+
+    g_heap = create_heap(1024 * 1024, 0);
+    if(g_heap == NULL){
+        printf("FAIL: create_heap\n");
+        return;
+    }
 
     g_msg_bytes = msg_bytes;
     g_window = window;
-
-    printf("\n=== BIG MEM + MULTI THREAD TEST ===\n");
-    printf("threads=%d, seconds=%d, msg=%zu KB, window=%d\n",
-           nthreads, seconds, g_msg_bytes / 1024, g_window);
-
-    g_heap = create_heap(1024 * 1024, 0);
-    if (!g_heap) {
-        printf("[FAIL] create_heap\n");
-        return 1;
-    }
-    printf("[OK] create_heap\n");
-
-    for (int r = 0; r < 2; r++) {
-        void *big[8] = {0};
-        for (int i = 0; i < 8; i++) {
-            big[i] = alloc_heap(g_heap, 1024 * 1024);
-            if (big[i]) memset(big[i], 0xCD, 256);
-        }
-        for (int i = 0; i < 8; i++) big[i] = NULL;
-        collect_heap(g_heap);
-    }
-    printf("[OK] warmup\n");
+    unsigned long long gc_calls = 0;
 
     pthread_t *t = (pthread_t*)calloc((size_t)nthreads, sizeof(pthread_t));
-    g_ops = (unsigned long long*)calloc((size_t)nthreads, sizeof(unsigned long long));
-    if (!t || !g_ops) {
-        printf("[FAIL] calloc\n");
+    WorkerArgs *args = (WorkerArgs*)calloc((size_t)nthreads, sizeof(WorkerArgs));
+    if (!t || !args) {
+        printf("FAIL: calloc failled (t=%p, args=%p)\n", (void*)t, (void*)args);
         free(t);
-        free(g_ops);
-        destroy_heap(g_heap);
-        return 1;
+        free(args);
+        destroy_heap(g_heap);   
+        g_heap = NULL;
+        return;
     }
 
     atomic_store(&g_stop, 0);
 
-    for (int i = 0; i < nthreads; i++)
-        pthread_create(&t[i], NULL, worker, (void*)(long)i);
+    for (int i = 0; i < nthreads; i++) {
+        args[i].id = i;
+        args[i].seed = (unsigned int)time(NULL) ^ (unsigned int)(i * 2654435761u);
+        args[i].ops = 0ULL;
+        pthread_create(&t[i], NULL, stress_worker, &args[i]);
+    }
 
-    for (int s = 0; s < seconds; s++) {
+    for (int s = 1; s <= seconds; s++) {
         for (int k = 0; k < 10; k++) {
             collect_heap(g_heap);
+            gc_calls++;
             usleep(100 * 1000); 
         }
-        printf("... %d/%d sec\n", s + 1, seconds);
+        unsigned long long sum_ok = 0, sum_fail = 0, sum_frees = 0;
+        for (int i = 0; i < nthreads; i++) {
+            sum_ok += args[i].alloc_ok;
+            sum_fail += args[i].alloc_fail;
+            sum_frees += args[i].explicit_frees;
+        }
+
+        double mem = rss_mb();
+        printf("[t=%2ds] gc_calls=%llu alloc_ok=%llu alloc_fail=%llu frees=%llu RAM_memory=%.1f MB\n", s, gc_calls, sum_ok, sum_fail, sum_frees, mem);   
     }
 
     atomic_store(&g_stop, 1);
@@ -130,32 +244,34 @@ int run_test(int nthreads, int seconds, size_t msg_bytes, int window)
     for (int i = 0; i < nthreads; i++)
         pthread_join(t[i], NULL);
 
-    unsigned long long total = 0;
-    for (int i = 0; i < nthreads; i++) total += g_ops[i];
-
-    printf("[RESULT] total ops = %llu\n", total);
-
     free(t);
-    free(g_ops);
+    free(args);
 
     destroy_heap(g_heap);
-    printf("[OK] destroy_heap\n");
+    g_heap = NULL;
+
+    printf("Test 3 completed.\n");
+}
+
+int main(void)
+{
+    printf("============TESTOVI ============\n");
+
+    Heap *h = create_heap(1024 * 1024, 0);
+    if(!h){return -1;}
+
+    run_roots_gc_test(h);
+
+    destroy_heap(h);
+
+    run_segment_growth_test();
+
+    int ths[] = { 1, 2, 5, 10 };
+    for (int i = 0; i < 4; i++) {
+        run_multithread_bigmem_test(ths[i], 15, 256 * 1024u, 4);
+    }
+
+    printf("==========================================================================\n");
+
     return 0;
 }
-
-#ifdef STANDALONE_TEST
-int main(int argc, char **argv)
-{
-    int nthreads = 10;
-    int seconds  = 15;
-    size_t kb    = 256;
-    int window   = 16;
-
-    if (argc >= 2) nthreads = atoi(argv[1]);
-    if (argc >= 3) seconds  = atoi(argv[2]);
-    if (argc >= 4) kb       = (size_t)atoi(argv[3]);
-    if (argc >= 5) window   = atoi(argv[4]);
-
-    return run_test(nthreads, seconds, kb * 1024u, window);
-}
-#endif
