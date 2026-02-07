@@ -89,7 +89,7 @@ static void run_roots_gc_test(Heap *h)
     collect_heap(h);
 
     for (int i = 0; i < 64; i++) {
-        if (((unsigned char*)a)[i] != 0xAB) {
+        if (((unsigned char*)a)[i] != 171) {
             printf("FAIL: a[%d] occupied after GC\n", i);
             roots_remove(h, &b);
             return;
